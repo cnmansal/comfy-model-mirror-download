@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-HF/CV镜像下载器 - 自动将 HuggingFace/CV 下载地址转换为国内镜像地址并下载到指定文件夹
+HF镜像下载器 - 自动将 HuggingFace 下载地址转换为国内镜像地址并下载到指定文件夹
 适用于 ComfyUI 工作流模型下载场景
 """
 
@@ -26,19 +26,24 @@ from tkinter import ttk, filedialog, scrolledtext, messagebox
 # 常量
 # ============================================================
 
-APP_TITLE = "ComfyUI HF / Civitai 镜像下载器 v1.0 (标签分组版)"
+APP_TITLE = "ComfyUI HF 镜像下载器 v1.0 (标签分组版)"
 MIRROR_DOMAIN = "hf-mirror.com"
-# 官方域名 → 镜像域名映射（www 变体须排在裸域名之前）
+# HF 官方域名 → 镜像域名（仅 HF 走镜像；CivitAI 直连官方，见 CIVITAI_HOSTS 注释）
 MIRROR_DOMAIN_MAP = {
     "huggingface.co": MIRROR_DOMAIN,
     "hf.co": MIRROR_DOMAIN,
-    "www.civitai.com": "civitai.red",
-    "civitai.com": "civitai.red",
 }
 CONFIG_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json")
 
 # 浏览器 UA：镜像站 / CivitAI 的 Cloudflare 会封禁 Python-urllib 默认 UA（错误码 1010）
 BROWSER_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+
+# CivitAI 域名（官方 + 旧镜像，仅用于识别站点类型）
+CIVITAI_HOSTS = ("civitai.com", "www.civitai.com", "civitai.red", "www.civitai.red")
+
+def is_civitai_url(url):
+    """判断是否 CivitAI 域名（官方或镜像）"""
+    return (urllib.parse.urlparse(url).hostname or "").lower() in CIVITAI_HOSTS
 
 
 def parse_content_disposition(headers):
@@ -138,6 +143,7 @@ class FileDownloader:
         self.log_cb = log_cb
         self.cancel_event = cancel_event or threading.Event()
         self.token = (token or "").strip()
+        self.is_civitai = is_civitai_url(url)  # 两站点鉴权方式不同，严格分流
         self.resolved_filename = None  # Content-Disposition 解析出的真实文件名（CivitAI 等）
 
     def download(self):
@@ -148,7 +154,9 @@ class FileDownloader:
         req.add_header("User-Agent", BROWSER_UA)  # 过 Cloudflare 对 Python-urllib 的封禁(1010)
         if existing > 0:
             req.add_header("Range", f"bytes={existing}-")
-        if self.token:
+        # 鉴权分流：HF 用 Bearer Token 头；CivitAI 用链接 ?token= 参数
+        # （HF Token 绝不发给 CivitAI 镜像站，避免凭证泄漏且对方也不识别）
+        if self.token and not self.is_civitai:
             req.add_header("Authorization", f"Bearer {self.token}")
 
         try:
@@ -165,11 +173,14 @@ class FileDownloader:
                     self.log_cb("  文件已完整，跳过")
                 return True, True
             if e.code in (401, 403):
-                # 镜像站对 gated 仓库未带 Token 时返回 401，官方站返回 403，统一处理
+                # 两站点分流提示：HF 为 gated 仓库；CivitAI 为需登录下载
                 if self.log_cb:
-                    hint = "" if self.token else "（gated 仓库：先在 HF 模型页同意协议，再配置 Token）"
-                    self.log_cb(f"  {e.code} - 无权限访问 {hint}")
-                raise NonRetryableError(f"{e.code} 无权限访问（gated 模型需 Token）")
+                    if self.is_civitai:
+                        self.log_cb(f"  {e.code} - CivitAI 拒绝访问（需登录的模型请在链接末尾追加 &token=你的APIKEY）")
+                    else:
+                        hint = "" if self.token else "（无权限：gated 模型先在模型页同意协议并配置 Token）"
+                        self.log_cb(f"  {e.code} - 无权限访问 {hint}")
+                raise NonRetryableError(f"{e.code} 无权限访问")
             if e.code == 404:
                 if self.log_cb:
                     self.log_cb("  404 - 文件不存在")
@@ -804,14 +815,45 @@ class HFMirrorApp:
             groups[current].append(line)
         return [(t, groups[t]) for t in order if groups[t]]
 
-    def _convert_url(self, url):
-        """将 HuggingFace / CivitAI 官方 URL 转换为镜像 URL"""
+    def _normalize_civitai_url(self, url):
+        """CivitAI 专用：模型页 URL → API 下载端点
+        页面地址（/models/93152）不是下载链接，直接请求会被拒绝；
+        真实下载端点是 /api/download/models/{modelId}，规则：
+        https://civitai.com/models/93152?...       → /api/download/models/93152?...
+        https://civitai.com/models/93152/98765?... → /api/download/models/93152?versionId=98765&...
+        已是 /api/download/ 开头的地址原样返回，不做任何改动"""
+        m = re.match(
+            r"(https?://(?:www\.)?civitai\.(?:com|red))/models/(\d+)(?:/(\d+))?/?(\\?.*)?$",
+            url,
+        )
+        if not m:
+            return url
+        base, mid, vid, q = m.group(1), m.group(2), m.group(3), m.group(4) or ""
+        params = urllib.parse.parse_qsl(q.lstrip("?"))
+        if vid:
+            params = [("versionId", vid)] + [(k, v) for k, v in params if k != "versionId"]
+        qs = urllib.parse.urlencode(params)
+        return f"{base}/api/download/models/{mid}" + (f"?{qs}" if qs else "")
+
+    def _convert_civitai_url(self, url):
+        """CivitAI 专用链路：仅做页面地址 → /api/download 下载端点的转换
+        不做镜像转换（镜像的 307 仍会跳回 civitai.com 官方 CDN，需直连）；
+        与 HF 逻辑无任何耦合；链接上的 ?token= 等参数原样透传"""
+        return self._normalize_civitai_url(url)
+
+    def _convert_hf_url(self, url):
+        """HF 专用链路：官方域名 → 镜像域名；浏览页 /blob/ → 下载地址 /resolve/"""
         for domain, mirror in MIRROR_DOMAIN_MAP.items():
             url = url.replace(f"https://{domain}/", f"https://{mirror}/")
             url = url.replace(f"http://{domain}/", f"http://{mirror}/")
-        # 浏览页面 /blob/ → 下载地址 /resolve/
         url = url.replace("/blob/main/", "/resolve/main/")
         return url
+
+    def _convert_url(self, url):
+        """URL 转换总入口：按站点分流，CivitAI 与 HuggingFace 互不混同"""
+        if is_civitai_url(url):
+            return self._convert_civitai_url(url)
+        return self._convert_hf_url(url)
 
     def _get_filename(self, url):
         parsed = urllib.parse.urlparse(url)
@@ -1036,7 +1078,15 @@ class HFMirrorApp:
         return None
 
     def _handle_gated_403(self, url, mirror_url):
-        """403 无权限（gated 模型）：打开仓库页面让用户点 Agree，之后可重新追加下载"""
+        """403 无权限处理（按站点分流，互不混同）
+        CivitAI → 提示补 API Token；HF gated → 打开协议页让用户点 Agree"""
+        if is_civitai_url(mirror_url):
+            # CivitAI 403：多为需要登录才能下载的模型
+            self._log("  → CivitAI 403：该模型可能需要登录后才能下载")
+            self._log("     到 civitai.com → 头像 → Account Settings → API Keys 生成 Key，")
+            self._log("     在链接末尾追加 &token=你的Key，再点「追加下载」重试")
+            self.seen_urls.discard(url)
+            return
         token = self.token_var.get().strip()
         if not token:
             self._log("  → 这是 gated 模型，请点「HF 登录…」完成登录后重试")
@@ -1060,6 +1110,7 @@ class HFMirrorApp:
         self._log(f"{prefix} 开始: {filename}")
 
         success = False
+        civitai = is_civitai_url(mirror_url)
         for attempt in range(MAX_RETRIES):
             if self.cancel_event.is_set():
                 break
@@ -1070,7 +1121,8 @@ class HFMirrorApp:
                         0, self._set_group_progress, bk, p, d, t2, s),
                     log_cb=self._log,
                     cancel_event=self.cancel_event,
-                    token=self.token_var.get().strip(),
+                    # HF Token 只用于 HF 链路；CivitAI 鉴权走链接 ?token= 参数
+                    token=None if civitai else self.token_var.get().strip(),
                 )
                 success, _ = downloader.download()
                 # CivitAI 等端点的真实文件名在下载时才解析得到

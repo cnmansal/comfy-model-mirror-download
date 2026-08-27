@@ -1,6 +1,6 @@
 # ComfyUI HF Mirror Download
 
-专为 ComfyUI 用户设计的镜像下载工具，自动将 HuggingFace 模型下载地址自动转换为 `hf-mirror.com` 镜像，按模型类型分类下载到本地文件夹，同时支持 Civitai。
+专为 ComfyUI 用户设计的模型下载工具：HuggingFace 链接自动转换为 `hf-mirror.com` 镜像加速下载，CivitAI 模型页地址自动转换为真实 API 下载端点（直连官方），按模型类型分类下载到本地文件夹。
 
 ![display.png](display.png)
 
@@ -38,7 +38,7 @@ python main.py
 ## 主要功能
 
 - **HuggingFace URL 自动转换**：`huggingface.co` / `hf.co` → `hf-mirror.com`；`/blob/main/` → `/resolve/main/`
-- **CivitAI URL 自动转换**：`civitai.com` / `civitai.red`
+- **CivitAI URL 自动转换**：`civitai.com/models/{id}` 自动转为真实下载端点 `civitai.com/api/download/models/{id}`（versionId、token 等参数保留；已是 `/api/download/` 开头的地址不改动）
 - **HF 一键登录**：点「HF 登录…」走 HuggingFace 官方设备码授权（RFC 8628，走镜像站），浏览器授权后 Token 自动填入保存，无需手动粘贴
 - **HF Token 支持**：下载 gated 模型（如 `Lightricks/LTX-2.5`）时填入 Token 即可，普通模型留空；403 时自动打开模型页提示点 Agree
 - **标签分组下载**：在 URL 框中使用 `[类型]` 标记分组，`[*]` 重置为默认类型
@@ -91,6 +91,16 @@ python main.py
 到 `https://huggingface.co/settings/tokens` 创建 **Read** Token（细粒度 Token 需勾选 gated repo 读取权限），粘贴到 "HF Token" 输入框（默认密文显示，点"显示"可核对）。
 
 Token 会随 `config.json` 保存在本地，注意不要把含 Token 的 config.json 分享给他人。
+
+## 下载 CivitAI 模型
+
+- 直接粘贴模型页地址即可，程序自动转为真实下载端点：
+  `https://civitai.com/models/93152?type=Model&format=SafeTensor&size=full&fp=fp16`
+  → `https://civitai.com/api/download/models/93152?type=Model&format=SafeTensor&size=full&fp=fp16`
+- 带 versionId 的页面地址（`/models/{id}/{versionId}`）自动转成 `?versionId=` 参数；粘贴的已是 `/api/download/` 地址则原样使用
+- **不走镜像**：镜像站的下载跳转最终仍指向 civitai.com 官方 CDN，因此 CivitAI 直连官方，需要本机能访问 civitai.com（如挂代理）
+- **需要登录的模型**：到 civitai.com → 头像 → Account Settings → API Keys 生成 Key，在链接末尾追加 `&token=你的APIKEY`；程序界面的 HF Token 仅用于 HuggingFace，不会发送给 CivitAI
+- 文件名自动从下载响应头（Content-Disposition）解析，无需手动指定
 
 ## 模型类型候选扫描
 
