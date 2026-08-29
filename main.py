@@ -565,6 +565,9 @@ class HFMirrorApp:
         self.btn_append.pack(side=tk.LEFT, padx=(8, 0))
         self.btn_cancel = ttk.Button(f_btn, text="取消下载", command=self._do_cancel, state=tk.DISABLED)
         self.btn_cancel.pack(side=tk.LEFT, padx=(8, 0))
+        # 清空任务随时可用：进行中/排队中/已失败的任务全部清掉
+        self.btn_clear = ttk.Button(f_btn, text="清空任务", command=self._clear_tasks)
+        self.btn_clear.pack(side=tk.LEFT, padx=(8, 0))
         ttk.Button(f_btn, text="清空日志", command=self._clear_log).pack(side=tk.RIGHT)
         ttk.Button(f_btn, text="清空已完成", command=self._clear_done_bars).pack(side=tk.RIGHT, padx=(0, 6))
         ttk.Button(f_btn, text="清空下载链接", command=self._clear_url_links).pack(side=tk.RIGHT, padx=(0, 6))
@@ -961,12 +964,8 @@ class HFMirrorApp:
         self.btn_append.config(state=tk.NORMAL)
         self.btn_cancel.config(state=tk.NORMAL)
 
-        # 初始化去重集合和任务计数
+        # 初始化去重集合和任务计数（同 URL 只入队一次，避免重复进度条 / 重复下载）
         self.seen_urls = set()
-        for _, urls in groups:
-            for url in urls:
-                self.seen_urls.add(url)
-        self._total_tasks = 0
 
         # 创建目录 + 进度条；本地已存在的文件不入队，进度条直接显示"已存在，跳过"
         skipped = 0
@@ -981,10 +980,15 @@ class HFMirrorApp:
                 self._log(f"[{mtype}] 已创建文件夹: {out_dir}")
             kept = []
             for url in urls:
+                if url in self.seen_urls:
+                    continue  # 同一 URL 在更早的组里已出现，跳过
+                self.seen_urls.add(url)
                 mirror = self._convert_url(url)
                 fname = self._get_filename(mirror)
                 bar_key = f"{mtype}/{fname}"
-                self._make_group_bar(bar_key)
+                # 同 mtype 内同 URL 多次粘贴 → 共用同一个进度条行，不重复创建
+                if bar_key not in self.prog_bars:
+                    self._make_group_bar(bar_key)
                 if os.path.exists(os.path.join(out_dir, fname)):
                     self._mark_bar_done(bar_key, "已存在，跳过")
                     skipped += 1
@@ -1016,6 +1020,32 @@ class HFMirrorApp:
         self.cancel_event.set()
         self._log("正在取消全部下载…")
 
+    def _clear_tasks(self):
+        """清空任务队列：随时可用，无论任务是排队中、下载中还是已失败
+        - 进行中的下载被中止（已写入的 .part 保留，重新下载可续传）
+        - 等待队列、任务计数、去重集合、进度条全部清空
+        - 调度器随后自行收尾并恢复按钮状态"""
+        if self.busy:
+            ans = messagebox.askyesno(
+                "确认清空",
+                "进行中的任务将被中止（已下载部分保留 .part，可续传），\n"
+                "等待中的任务将被丢弃。确定清空全部任务吗？",
+            )
+            if not ans:
+                return
+            self.cancel_event.set()  # 停止调度器循环 + 中止进行中的下载
+        pending = len(self.download_queue)
+        self.download_queue.clear()
+        self.seen_urls.clear()
+        self._total_tasks = 0
+        self._clear_group_bars()  # 清掉所有进度条（含失败/取消的）
+        msg = "任务已全部清空"
+        if pending:
+            msg += f"（丢弃 {pending} 个等待中的任务）"
+        if self.busy:
+            msg += "，正在中止进行中的下载…"
+        self._log(msg)
+
     def _append_download(self):
         """追加下载：解析文本框，对已入队的 URL 去重，仅追加新链接到调度队列"""
         if not self.busy or not self._scheduler_running:
@@ -1041,7 +1071,8 @@ class HFMirrorApp:
                 bar_key = f"{mtype}/{fname}"
                 # 本地已存在 → 进度条直接显示完成，不入队
                 if os.path.exists(os.path.join(out_dir, fname)):
-                    self._make_group_bar(bar_key)
+                    if bar_key not in self.prog_bars:
+                        self._make_group_bar(bar_key)
                     self._mark_bar_done(bar_key, "已存在，跳过")
                     self._log(f"[{mtype}] 已存在，跳过: {fname}")
                     skipped += 1
@@ -1052,8 +1083,9 @@ class HFMirrorApp:
                 if not os.path.exists(out_dir):
                     os.makedirs(out_dir)
                     self._log(f"[{mtype}] 已创建文件夹: {out_dir}")
-                # 创建进度条
-                self._make_group_bar(bar_key)
+                # 创建进度条（同名 bar 共用一行，不重复创建）
+                if bar_key not in self.prog_bars:
+                    self._make_group_bar(bar_key)
                 new_count += 1
 
         self._total_tasks += new_count
